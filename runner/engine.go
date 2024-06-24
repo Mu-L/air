@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gohugoio/hugo/watcher/filenotify"
@@ -18,6 +17,7 @@ import (
 // Engine ...
 type Engine struct {
 	config    *Config
+	proxy     *Proxy
 	logger    *logger
 	watcher   filenotify.FileWatcher
 	debugMode bool
@@ -31,9 +31,9 @@ type Engine struct {
 	binStopCh      chan bool
 	exitCh         chan bool
 
+	procKillWg    sync.WaitGroup
 	mu            sync.RWMutex
 	watchers      uint
-	round         uint64
 	fileChecksums *checksumMap
 
 	ll sync.Mutex // lock for logger
@@ -48,6 +48,7 @@ func NewEngineWithConfig(cfg *Config, debugMode bool) (*Engine, error) {
 	}
 	e := Engine{
 		config:         cfg,
+		proxy:          NewProxy(&cfg.Proxy),
 		logger:         logger,
 		watcher:        watcher,
 		debugMode:      debugMode,
@@ -310,6 +311,11 @@ func (e *Engine) isModified(filename string) bool {
 
 // Endless loop and never return
 func (e *Engine) start() {
+	if e.config.Proxy.Enabled {
+		go e.proxy.Run()
+		e.mainLog("Proxy server listening on http://localhost%s", e.proxy.server.Addr)
+	}
+
 	e.running = true
 	firstRunCh := make(chan bool, 1)
 	firstRunCh <- true
@@ -333,7 +339,7 @@ func (e *Engine) start() {
 			}
 
 			// cannot set buldDelay to 0, because when the write multiple events received in short time
-			// it will start Multiple buildRuns: https://github.com/cosmtrek/air/issues/473
+			// it will start Multiple buildRuns: https://github.com/air-verse/air/issues/473
 			time.Sleep(e.config.buildDelay())
 			e.flushEvents()
 
@@ -473,8 +479,7 @@ func (e *Engine) runPostCmd() error {
 }
 
 func (e *Engine) runBin() error {
-	killFunc := func(cmd *exec.Cmd, stdout io.ReadCloser, stderr io.ReadCloser, killCh chan struct{}, processExit chan struct{}, wg *sync.WaitGroup) {
-		defer wg.Done()
+	killFunc := func(cmd *exec.Cmd, stdout io.ReadCloser, stderr io.ReadCloser, killCh chan struct{}, processExit chan struct{}) {
 		select {
 		// listen to binStopCh
 		// cleanup() will close binStopCh when engine stop
@@ -513,13 +518,11 @@ func (e *Engine) runBin() error {
 
 	e.runnerLog("running...")
 	go func() {
-		wg := sync.WaitGroup{}
 
 		defer func() {
 			select {
 			case <-e.exitCh:
 				e.mainDebug("exit in runBin")
-				wg.Wait()
 			default:
 			}
 		}()
@@ -531,17 +534,19 @@ func (e *Engine) runBin() error {
 			case <-killCh:
 				return
 			default:
+				e.procKillWg.Add(1)
 				command := strings.Join(append([]string{e.config.Build.Bin}, e.runArgs...), " ")
 				cmd, stdout, stderr, _ := e.startCmd(command)
 				processExit := make(chan struct{})
 				e.mainDebug("running process pid %v", cmd.Process.Pid)
+				if e.config.Proxy.Enabled {
+					e.proxy.Reload()
+				}
 
-				wg.Add(1)
-				atomic.AddUint64(&e.round, 1)
 				e.withLock(func() {
 					close(e.binStopCh)
 					e.binStopCh = make(chan bool)
-					go killFunc(cmd, stdout, stderr, killCh, processExit, &wg)
+					go killFunc(cmd, stdout, stderr, killCh, processExit)
 				})
 
 				go func() {
@@ -563,6 +568,7 @@ func (e *Engine) runBin() error {
 				default:
 					e.runnerLog("Process Exit with Code: %v", state.ExitCode())
 				}
+				e.procKillWg.Done()
 
 				if !e.config.Build.Rerun {
 					return
@@ -578,6 +584,13 @@ func (e *Engine) runBin() error {
 func (e *Engine) cleanup() {
 	e.mainLog("cleaning...")
 	defer e.mainLog("see you again~")
+
+	if e.config.Proxy.Enabled {
+		e.mainDebug("powering down the proxy...")
+		if err := e.proxy.Stop(); err != nil {
+			e.mainLog("failed to stop proxy: %+v", err)
+		}
+	}
 
 	e.withLock(func() {
 		close(e.binStopCh)
@@ -607,7 +620,7 @@ func (e *Engine) cleanup() {
 	}
 
 	e.mainDebug("waiting for exit...")
-
+	e.procKillWg.Wait()
 	e.running = false
 	e.mainDebug("exited")
 }
